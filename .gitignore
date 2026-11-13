@@ -1,0 +1,21 @@
+# Never commit local vault data or secrets
+BovedaFIDO2/
+BovedaThetis/
+Trabajo/
+backups/
+*.age
+*.key
+*identity*.txt
+*identidad*.txt
+*recuperacion*.txt
+.env
+.env.*
+*.pem
+*.p12
+*.pfx
+*.tar.gz
+__pycache__/
+*.py[cod]
+.DS_Store
+.idea/
+.vscode/

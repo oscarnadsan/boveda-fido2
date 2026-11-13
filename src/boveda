@@ -1,0 +1,777 @@
+#!/usr/bin/env python3
+"""Bóveda local age: Thetis FIDO2 o recuperación por DOS contraseñas.
+Los datos descifrados residen en ~/BovedaFIDO2/Trabajo mientras está abierta.
+"""
+import argparse
+import hashlib
+import json
+import zipfile
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+from datetime import datetime
+from pathlib import Path
+
+os.umask(0o077)
+ROOT = Path.home() / 'BovedaFIDO2'
+WORK = ROOT / 'Trabajo'
+IDENTITY = ROOT / 'identidad-fido2.txt'
+EXTRA_KEYS = ROOT / 'llaves-fido2'
+RECOVERY = ROOT / 'recuperacion-v2' / 'recuperacion-doble.age'
+PUB = ROOT / 'recuperacion-v2' / 'recuperacion-publica.txt'
+CONFIG = ROOT / '.boveda-config.json'
+ARCHIVE = 'documentos.tar.age'
+os.environ['PATH'] = str(Path.home() / '.local/bin') + os.pathsep + '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:' + os.environ.get('PATH', '')
+
+
+def fail(message):
+    raise RuntimeError(message)
+
+
+def run(args, **kw):
+    return subprocess.run(args, check=True, **kw)
+
+
+def init_root():
+    ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(ROOT, 0o700)
+
+
+def storage():
+    if CONFIG.exists():
+        data = json.loads(CONFIG.read_text(encoding='utf-8'))
+        value = data.get('storage')
+        if not isinstance(value, str) or not value.startswith('/'):
+            fail('Configuración de ubicación inválida.')
+        return Path(value)
+    return ROOT
+
+
+def archive():
+    return storage() / ARCHIVE
+
+
+def require_storage(write=False):
+    path = storage()
+    if not path.is_dir():
+        fail(f'Ubicación no disponible: {path}. ¿Has conectado el USB?')
+    if write and not os.access(path, os.W_OK):
+        fail(f'Sin permiso de escritura: {path}')
+    return path
+
+
+def require_keys():
+    for f in (RECOVERY, PUB):
+        if not f.is_file() or f.stat().st_size == 0:
+            fail(f'Falta la clave necesaria: {f}. Ejecuta boveda configurar.')
+    if not identities():
+        fail('No queda ninguna identidad FIDO2. Ejecuta boveda configurar.')
+    if not shutil.which('age'):
+        fail('Falta age; ejecuta bash instalar.sh')
+
+
+def identities():
+    files = [IDENTITY] if IDENTITY.is_file() else []
+    if EXTRA_KEYS.is_dir():
+        files += sorted(EXTRA_KEYS.glob('*.txt'))
+    return files
+
+
+def key_public(path):
+    p = re.findall(r'^# public key: (age1[a-z0-9]+)$', path.read_text(encoding='utf-8'), re.M)
+    if len(p) != 1:
+        fail(f'Identidad FIDO2 inválida: {path}')
+    return p[0]
+
+
+def public_keys():
+    require_keys()
+    fido = [key_public(p) for p in identities()]
+    recovery = PUB.read_text(encoding='utf-8').strip()
+    if not fido or not re.fullmatch(r'age1[a-z0-9]+', recovery):
+        fail('Claves públicas incorrectas. No se modifica nada.')
+    return list(dict.fromkeys(fido + [recovery]))
+
+
+def check_work():
+    if WORK.is_symlink():
+        fail('Trabajo es un enlace simbólico; operación cancelada.')
+    if not WORK.is_dir():
+        fail('Bóveda cerrada. Ejecuta boveda abrir.')
+
+
+def scan():
+    check_work()
+    found = []
+    for base, dirs, files in os.walk(WORK, followlinks=False):
+        for item in dirs + files:
+            p = Path(base) / item
+            mode = p.lstat().st_mode
+            if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+                fail(f'Elemento especial o enlace prohibido: {p}')
+        for item in files:
+            found.append(Path(base) / item)
+    return found
+
+
+def choose_method():
+    if not sys.stdin.isatty():
+        fail('Elige el método en una Terminal interactiva.')
+    print('Desbloqueo: [1] Llave FIDO2   [2] dos contraseñas')
+    answer = input('Método [1/2]: ').strip()
+    if answer not in ('1', '2'):
+        fail('Método incorrecto.')
+    return answer
+
+
+def recovered_identity():
+    print('Introduce CONTRASEÑA 2 (capa exterior):', flush=True)
+    outer = run(['age', '-d', str(RECOVERY)], stdout=subprocess.PIPE).stdout
+    print('Introduce CONTRASEÑA 1 (capa interior):', flush=True)
+    try:
+        return run(['age', '-d'], input=outer, stdout=subprocess.PIPE).stdout
+    finally:
+        del outer
+
+
+def decrypt_stream(path, method):
+    if method == '1':
+        available = identities()
+        print('Llaves disponibles:')
+        for n, identity_file in enumerate(available, 1):
+            print(f'  {n}. {identity_file.stem}')
+        index = input('Elige la llave [1]: ').strip() or '1'
+        if not index.isdigit() or not 1 <= int(index) <= len(available):
+            fail('Llave no válida.')
+        return subprocess.Popen(['age', '-d', '-i', str(available[int(index)-1]), str(path)], stdout=subprocess.PIPE)
+    ident = recovered_identity()
+    try:
+        # Popen.communicate evita bloqueo entre tuberías y cierra stdin.
+        # El archivo cifrado puede ser grande: para no cargarlo en RAM, la identidad
+        # se envía primero a través de una tubería pequeña y age produce un stream.
+        proc = subprocess.Popen(['age', '-d', '-i', '-', str(path)], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        proc.stdin.write(ident)
+        proc.stdin.close()
+        return proc
+    finally:
+        del ident
+
+
+def extract_safe(stream, target):
+    with tarfile.open(fileobj=stream, mode='r|gz') as tar:
+        for m in tar:
+            name = Path(m.name)
+            if (not name.parts or name.is_absolute() or
+                any(x in ('.', '..') for x in name.parts)):
+                fail('Ruta insegura en el archivo. Extracción cancelada.')
+            out = target.joinpath(*name.parts)
+            if m.isdir():
+                if out.exists() and not out.is_dir():
+                    fail('Conflicto de nombres en el archivo cifrado.')
+                out.mkdir(mode=0o700, parents=True, exist_ok=True)
+            elif m.isfile():
+                out.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                if out.exists() or out.is_symlink():
+                    fail('Entrada duplicada en archivo cifrado.')
+                with tar.extractfile(m) as source, out.open('xb') as dest:
+                    shutil.copyfileobj(source, dest)
+                out.chmod(0o600)
+            else:
+                fail('El archivo contiene enlaces o elementos no permitidos.')
+
+
+def abrir():
+    public_keys()
+    require_storage()
+    dest = archive()
+    if WORK.exists() or WORK.is_symlink():
+        fail('Ya existe Trabajo. Ejecuta boveda estado; no se sobrescribe.')
+    if not dest.exists():
+        if (ROOT / ARCHIVE).exists() and dest != ROOT / ARCHIVE:
+            fail('Hay un archivo cifrado antiguo en la ubicación anterior. Comprueba boveda ubicacion.')
+        WORK.mkdir(mode=0o700)
+        print('Bóveda nueva, vacía.')
+    else:
+        choice = choose_method()
+        proc = decrypt_stream(dest, choice)
+        WORK.mkdir(mode=0o700)
+        try:
+            extract_safe(proc.stdout, WORK)
+            proc.stdout.close()
+            if proc.wait() != 0:
+                fail('age no ha podido verificar/descifrar correctamente el archivo.')
+        except BaseException:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+            # Preservar el estado parcial para diagnóstico, sin sobrescribir nada.
+            print('ATENCIÓN: Trabajo podría contener datos parciales en claro; revisa antes de repetir.', file=sys.stderr)
+            raise
+    print('ABIERTA:', WORK)
+    print('AVISO: los documentos están DESCIFRADOS hasta ejecutar boveda cerrar.')
+    opener = 'open' if sys.platform == 'darwin' else 'xdg-open'
+    if shutil.which(opener):
+        subprocess.run([opener, str(WORK)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+
+def sync_fsync(fileobj):
+    fileobj.flush()
+    os.fsync(fileobj.fileno())
+
+
+def cerrar():
+    public_keys()
+    require_storage(write=True)
+    items = scan()
+    print(f'Se van a cifrar {len(items)} archivos. Guarda y cierra Word, Pages, TextEdit, etc.')
+    if input('Escribe CERRAR para continuar: ').strip() != 'CERRAR':
+        fail('Cancelado, Trabajo sigue abierto.')
+    recipients = public_keys()
+    fd, temp_name = tempfile.mkstemp(prefix='.boveda-pendiente-', suffix='.age', dir=storage())
+    tmp = Path(temp_name)
+    os.close(fd)
+    old = archive()
+    previous = storage() / ('documentos.anterior-' + datetime.now().strftime('%Y%m%d-%H%M%S-%f') + '.tar.age')
+    try:
+        with tmp.open('wb') as target:
+            proc = subprocess.Popen(['age'] + [arg for key in recipients for arg in ('-r', key)], stdin=subprocess.PIPE, stdout=target)
+            try:
+                with tarfile.open(fileobj=proc.stdin, mode='w|gz', dereference=False) as tar:
+                    for base, dirs, names in os.walk(WORK, followlinks=False):
+                        for item in dirs + names:
+                            p = Path(base) / item
+                            tar.add(p, arcname=str(p.relative_to(WORK)), recursive=False)
+                # tarfile.close() NO cierra la tubería; de lo contrario age espera EOF.
+                proc.stdin.close()
+            except BaseException:
+                proc.kill()
+                proc.wait()
+                raise
+            if proc.wait() != 0:
+                fail('age no terminó correctamente; Trabajo sigue intacto.')
+            sync_fsync(target)
+        if tmp.stat().st_size < 100:
+            fail('Salida cifrada demasiado pequeña; Trabajo permanece intacto.')
+        if previous.exists():
+            fail(f'Existe copia anterior {previous}; no se sobrescribe.')
+        if old.exists():
+            os.replace(old, previous)
+        try:
+            os.replace(tmp, old)
+        except BaseException:
+            if previous.exists() and not old.exists():
+                os.replace(previous, old)
+            raise
+        old.chmod(0o600)
+        # Verificar que el archivo es descifrable queda pendiente de reabrir.
+        # Conservar Trabajo si falla el borrado, sin fingir bóveda cerrada.
+        shutil.rmtree(WORK)
+        print('BÓVEDA CERRADA:', old)
+        if previous.exists():
+            print('Copia cifrada de la versión anterior:', previous)
+        print('El borrado de archivos descifrados NO garantiza eliminación forense en SSD.')
+        print('Haz boveda backup y verifica que puedes reabrir la bóveda.')
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def estado():
+    print('Configuración:', ROOT)
+    print('Almacenamiento cifrado:', storage())
+    print('Archivo:', archive())
+    print('Estado:', 'ABIERTA (datos en claro)' if WORK.is_dir() else 'CERRADA')
+    print('Cifrado existente:', 'sí' if archive().is_file() else 'no')
+    print('Llaves FIDO2:', len(identities()))
+    print('Doble contraseña:', 'sí' if RECOVERY.is_file() else 'no')
+    if WORK.is_dir():
+        print('Documentos:', len(scan()))
+
+
+def nombre_seguro(name):
+    if not name or name in ('.', '..') or '/' in name or '\\' in name or name.startswith('.'):
+        fail('Nombre no válido: usa un nombre de archivo sencillo.')
+    return name
+
+
+def create_docx(target):
+    """Create a minimal valid OOXML Word document without optional dependencies."""
+    ct = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+          '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+          '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+          '<Default Extension="xml" ContentType="application/xml"/>'
+          '<Override PartName="/word/document.xml" '
+          'ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+          '</Types>')
+    rels = ('<?xml version="1.0" encoding="UTF-8"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" '
+            'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+            'Target="word/document.xml"/></Relationships>')
+    document = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+                '<w:body><w:p><w:r><w:t>Documento nuevo</w:t></w:r></w:p>'
+                '<w:sectPr/></w:body></w:document>')
+    with zipfile.ZipFile(target, 'x', compression=zipfile.ZIP_DEFLATED) as doc:
+        doc.writestr('[Content_Types].xml', ct)
+        doc.writestr('_rels/.rels', rels)
+        doc.writestr('word/document.xml', document)
+
+
+def nuevo(name):
+    check_work()
+    target = WORK / nombre_seguro(name)
+    if target.exists():
+        fail(f'Ya existe: {target}')
+    ext = target.suffix.lower()
+    if ext in ('.txt', '.md', '.csv'):
+        with target.open('x', encoding='utf-8') as out:
+            out.write('')
+    elif ext == '.docx':
+        create_docx(target)
+    elif ext == '.rtf':
+        with target.open('x', encoding='utf-8') as out:
+            out.write(r'{\rtf1\ansi Documento nuevo}')
+    else:
+        fail('Formatos de creación: .txt, .md, .csv, .docx, .rtf; puedes importar cualquier otro.')
+    target.chmod(0o600)
+    print('Documento creado:', target)
+    opener = ['open'] if sys.platform == 'darwin' else ['xdg-open']
+    if shutil.which(opener[0]):
+        subprocess.run(opener + [str(target)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+
+def safe_source(src):
+    if src.is_symlink():
+        fail(f'No se admiten enlaces simbólicos: {src}')
+    if src.is_file():
+        return
+    if not src.is_dir():
+        fail(f'No es un archivo o carpeta válida: {src}')
+    for base, dirs, files in os.walk(src, followlinks=False):
+        for item in dirs + files:
+            path = Path(base) / item
+            mode = path.lstat().st_mode
+            if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+                fail(f'Enlace o archivo especial no admitido: {path}')
+
+
+def add(sources):
+    check_work()
+    planned = []
+    for raw in sources:
+        src = Path(raw).expanduser().absolute()
+        if not src.exists():
+            fail(f'No existe: {src}')
+        safe_source(src)
+        dst = WORK / src.name
+        if dst.exists() or dst.is_symlink():
+            fail(f'Ya existe un archivo con ese nombre en la bóveda: {dst.name}')
+        if src == WORK or WORK in src.parents or src in WORK.parents:
+            fail('No puedes importar la carpeta Trabajo, sus antecesores o su contenido.')
+        planned.append((src, dst))
+    if len(set(str(d) for _, d in planned)) != len(planned):
+        fail('Hay nombres repetidos entre las fuentes.')
+    for src, dst in planned:
+        if src.is_dir():
+            shutil.copytree(src, dst, symlinks=False)
+        else:
+            shutil.copy2(src, dst, follow_symlinks=False)
+        print('Copiado a la bóveda:', dst)
+    print('Los originales NO se han borrado. Ejecuta boveda cerrar para cifrar las copias.')
+
+
+def listar():
+    check_work()
+    for p in sorted(scan()):
+        print(p.relative_to(WORK))
+
+
+def borrar(names):
+    check_work()
+    chosen = []
+    for name in names:
+        p = Path(name)
+        if p.is_absolute() or '..' in p.parts or '.' in p.parts or not p.parts:
+            fail('Ruta insegura. Usa nombres relativos a Trabajo.')
+        target = WORK.joinpath(*p.parts)
+        if not target.exists() or target.is_symlink():
+            fail(f'No existe o es enlace: {name}')
+        if target == WORK:
+            fail('No se puede borrar Trabajo.')
+        chosen.append(target)
+    print('Se eliminarán de la VERSIÓN ABIERTA (tras cerrar):')
+    for p in chosen:
+        print(' -', p.relative_to(WORK))
+    print('Las copias cifradas previas/backups pueden conservar versiones anteriores.')
+    if input('Escribe BORRAR para confirmar: ').strip() != 'BORRAR':
+        fail('Borrado cancelado.')
+    for p in chosen:
+        if p.is_dir():
+            shutil.rmtree(p)
+        else:
+            p.unlink()
+    print('Eliminado de Trabajo. Ejecuta boveda cerrar para actualizar el archivo cifrado.')
+
+
+def ubicacion(path):
+    init_root()
+    if path is None:
+        print('Ubicación de los DATOS CIFRADOS:', storage())
+        print('Carpeta de trabajo EN CLARO (equipo local):', WORK)
+        return
+    if WORK.exists():
+        fail('Cierra la bóveda antes de cambiar la ubicación.')
+    selected = Path(path).expanduser().absolute()
+    # No crear silenciosamente una carpeta en /Volumes si el USB no está montado.
+    if selected.parts[:2] == ('/', 'Volumes') and len(selected.parts) >= 3:
+        volume = Path('/Volumes') / selected.parts[2]
+        if not volume.is_dir() or not os.path.ismount(volume):
+            fail(f'USB no montado: {volume}. Conéctalo antes de seleccionar la ubicación.')
+    # En Linux, verificar montajes para destinos extraíbles habituales.
+    if sys.platform != 'darwin':
+        parts = selected.parts
+        if len(parts) >= 4 and parts[1] == 'media':
+            mount_prefix = Path('/media') / parts[2] / parts[3]
+        elif len(parts) >= 5 and parts[1:3] == ('run', 'media'):
+            mount_prefix = Path('/run/media') / parts[3] / parts[4]
+        else:
+            mount_prefix = None
+        if mount_prefix is not None and not os.path.ismount(mount_prefix):
+            fail(f'Volumen no montado: {mount_prefix}')
+    if selected == WORK or WORK in selected.parents:
+        fail('No almacenes el archivo cifrado dentro de Trabajo.')
+    selected.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if not selected.is_dir() or selected.is_symlink():
+        fail('La ubicación elegida no es una carpeta válida.')
+    old = archive()
+    dest = selected / ARCHIVE
+    if dest.exists() and dest != old:
+        fail(f'Ya hay una bóveda en el destino: {dest}. No se sobrescribe.')
+    if old.is_file() and old != dest:
+        fd, temp_name = tempfile.mkstemp(prefix='.boveda-copia-', dir=selected)
+        tmp = Path(temp_name)
+        os.close(fd)
+        try:
+            shutil.copy2(old, tmp)
+            def digest(p):
+                h = hashlib.sha256()
+                with p.open('rb') as stream:
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                        h.update(chunk)
+                return h.digest()
+            if digest(old) != digest(tmp):
+                fail('La copia al USB no coincide. Configuración sin cambios.')
+            os.replace(tmp, dest)
+            dest.chmod(0o600)
+        finally:
+            tmp.unlink(missing_ok=True)
+        print('Se ha COPIADO y verificado el cifrado a:', dest)
+        print('La copia cifrada antigua se conserva en:', old)
+    if selected != storage():
+        fd, config_name = tempfile.mkstemp(prefix='.config-', dir=ROOT)
+        temp_config = Path(config_name)
+        os.close(fd)
+        try:
+            temp_config.write_text(json.dumps({'storage': str(selected)}, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+            os.replace(temp_config, CONFIG)
+            CONFIG.chmod(0o600)
+        finally:
+            temp_config.unlink(missing_ok=True)
+    print('Ubicación activa:', selected)
+    print('Para USB: debes conectar el volumen antes de abrir o cerrar.')
+
+
+def backup(destination):
+    require_keys()
+    if WORK.exists():
+        fail('Cierra antes de hacer un backup consistente.')
+    source = archive()
+    if not source.is_file():
+        fail('No hay todavía archivo cifrado; abre y cierra primero.')
+    outdir = Path(destination).expanduser().absolute() if destination else ROOT / 'backups'
+    outdir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    target = outdir / ('boveda-backup-' + datetime.now().strftime('%Y%m%d-%H%M%S') + '.tar.gz')
+    if target.exists():
+        fail('Ya existe un backup con ese nombre.')
+    with tarfile.open(target, 'x:gz') as tar:
+        for file, name in [(source, ARCHIVE), (RECOVERY, 'recuperacion-v2/recuperacion-doble.age'),
+                           (PUB, 'recuperacion-v2/recuperacion-publica.txt')] + [(f, str(f.relative_to(ROOT))) for f in identities()]:
+            tar.add(file, arcname=name, recursive=False)
+    target.chmod(0o600)
+    print('BACKUP:', target)
+    print('Incluye archivo cifrado e identidades; conserva una copia en otro soporte.')
+    print('El tar.gz NO tiene cifrado adicional; sus documentos internos sí están cifrados con age.')
+
+
+def exportar(destination):
+    check_work()
+    dest = Path(destination).expanduser().absolute()
+    if dest.exists():
+        fail('La carpeta de exportación ya existe. Elige una ruta NUEVA.')
+    if dest == WORK or WORK in dest.parents or dest in WORK.parents:
+        fail('Destino inseguro; elige una carpeta diferente a Trabajo.')
+    scan()
+    print('ATENCIÓN: crearás una copia SIN CIFRAR en:', dest)
+    if input('Escribe EXPORTAR para continuar: ').strip() != 'EXPORTAR':
+        fail('Exportación cancelada.')
+    shutil.copytree(WORK, dest, symlinks=False)
+    print('Documentos EXPORTADOS EN CLARO:', dest)
+
+
+def configurar():
+    init_root()
+    if WORK.exists():
+        fail('Cierra antes de configurar claves.')
+    if not shutil.which('age') or not shutil.which('age-keygen'):
+        fail('Faltan age/age-keygen. Ejecuta instalar.sh.')
+    plugin = shutil.which('age-plugin-fido2-hmac')
+    if not plugin:
+        fail('Falta age-plugin-fido2-hmac. Ejecuta instalar.sh.')
+    if not identities():
+        print('Crear identidad Thetis. Usa PIN y toca la llave cuando se solicite.')
+        fd, name = tempfile.mkstemp(prefix='.fido-pendiente-', dir=ROOT)
+        tmp = Path(name)
+        os.close(fd)
+        try:
+            with tmp.open('wb') as out:
+                run([plugin, '-g'], stdout=out)
+            text = tmp.read_text(encoding='utf-8')
+            if not re.search(r'^# public key: age1', text, re.M) or 'AGE-PLUGIN-FIDO2-HMAC-' not in text:
+                fail('La identidad FIDO2 no se generó correctamente.')
+            os.replace(tmp, IDENTITY)
+        finally:
+            tmp.unlink(missing_ok=True)
+    else:
+        print('Conservada identidad FIDO2 existente.')
+    if not RECOVERY.exists() or not PUB.exists():
+        if RECOVERY.exists() or PUB.exists():
+            fail('Recuperación incompleta; no sobrescribo archivos existentes.')
+        RECOVERY.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        print('Crea dos contraseñas DISTINTAS. Nunca dejes vacía la entrada (age autogenera).')
+        identity = run(['age-keygen'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL).stdout
+        public = run(['age-keygen', '-y'], input=identity, stdout=subprocess.PIPE).stdout
+        fd, second = tempfile.mkstemp(prefix='.recuperacion-', suffix='.age', dir=RECOVERY.parent)
+        result = Path(second)
+        os.close(fd)
+        try:
+            print('CONTRASEÑA 1: NO dejes el campo vacío', flush=True)
+            first_layer = run(['age', '-p'], input=identity, stdout=subprocess.PIPE).stdout
+            print('CONTRASEÑA 2: debe ser distinta; NO dejes el campo vacío', flush=True)
+            with result.open('wb') as out:
+                run(['age', '-p'], input=first_layer, stdout=out)
+            del first_layer
+            if result.stat().st_size < 100:
+                fail('Resultado de recuperación incompleto.')
+            os.replace(result, RECOVERY)
+            PUB.write_bytes(public)
+            PUB.chmod(0o600)
+            print('IMPORTANTE: verifica las dos contraseñas con boveda verificar.')
+        finally:
+            result.unlink(missing_ok=True)
+            del identity
+    else:
+        print('Conservada recuperación doble existente.')
+    public_keys()
+    print('CONFIGURACIÓN LISTA. Ejecuta: boveda verificar')
+
+
+def verificar():
+    keys = public_keys()
+    pub_rec = keys[-1]
+    print('Llaves FIDO2 registradas:', len(identities()))
+    identity = recovered_identity()
+    try:
+        actual = run(['age-keygen', '-y'], input=identity, stdout=subprocess.PIPE).stdout.decode().strip()
+    finally:
+        del identity
+    if actual != pub_rec:
+        fail('La identidad recuperada NO coincide con la clave pública esperada.')
+    print('RECUPERACIÓN VERIFICADA: las dos contraseñas correctas recuperan la identidad.')
+    print('Para verificar la Thetis, abre un archivo cifrado con boveda abrir.')
+
+
+def llaves_listar():
+    for i, path in enumerate(identities(), 1):
+        print(f'{i}. {path.stem}: {key_public(path)}')
+    if not identities():
+        print('No hay llaves configuradas. Ejecuta boveda configurar.')
+
+
+def llaves_anadir(name):
+    check_work()
+    if not re.fullmatch(r'[a-zA-Z0-9_-]{1,40}', name):
+        fail('El nombre debe tener 1-40 letras, números, guion o guion bajo.')
+    if name in ('identidad-fido2', 'identidad'):
+        fail('Nombre reservado.')
+    EXTRA_KEYS.mkdir(mode=0o700, exist_ok=True)
+    dest = EXTRA_KEYS / f'{name}.txt'
+    if dest.exists():
+        fail('Ya existe una llave con ese nombre.')
+    plugin = shutil.which('age-plugin-fido2-hmac')
+    if not plugin:
+        fail('Instala age-plugin-fido2-hmac antes.')
+    fd, tmpname = tempfile.mkstemp(prefix='.nueva-', dir=EXTRA_KEYS)
+    tmp = Path(tmpname)
+    os.close(fd)
+    try:
+        print('Conecta y toca la NUEVA llave FIDO2. No desconectes la anterior si la necesitas.')
+        with tmp.open('wb') as out:
+            run([plugin, '-g'], stdout=out)
+        if 'AGE-PLUGIN-FIDO2-HMAC-' not in tmp.read_text(encoding='utf-8'):
+            fail('La generación de la identidad no se completó.')
+        new_public = key_public(tmp)
+        if new_public in public_keys():
+            fail('Esta identidad ya está registrada.')
+        os.replace(tmp, dest)
+        dest.chmod(0o600)
+    finally:
+        tmp.unlink(missing_ok=True)
+    print('Llave añadida:', dest)
+    print('IMPORTANTE: ejecuta boveda cerrar y prueba después a abrir con la nueva llave.')
+    print('Hasta el siguiente cierre, la nueva llave NO descifra el archivo cifrado anterior.')
+
+
+def llaves_quitar(name):
+    check_work()
+    file = next((p for p in identities() if p.stem == name), None)
+    if file is None:
+        fail('Nombre de llave no encontrado. Ejecuta boveda llaves listar.')
+    if len(identities()) < 2:
+        fail('No se retira la última llave FIDO2. Añade otra primero.')
+    if input(f'Escribe QUITAR para retirar {name}: ').strip() != 'QUITAR':
+        fail('Cancelado.')
+    # Mantener identidad retirada en backup fuera de la lista activa hasta confirmar re-cifrado.
+    disabled = ROOT / 'llaves-retiradas'
+    disabled.mkdir(mode=0o700, exist_ok=True)
+    target = disabled / (file.name + '.' + datetime.now().strftime('%Y%m%d%H%M%S'))
+    if target.exists():
+        fail('Conflicto de archivo en llaves retiradas.')
+    os.replace(file, target)
+    print('Retirada de los destinatarios futuros. Archivo de identidad preservado en:', target)
+    print('Ejecuta boveda cerrar y verifica el acceso. Copias cifradas antiguas aún pueden ser descifradas con la llave retirada.')
+
+
+def claves_cambiar():
+    # Se conserva la misma identidad age de recuperación; solo cambian las dos contraseñas.
+    require_keys()
+    if WORK.exists():
+        fail('Cierra la bóveda antes de cambiar contraseñas.')
+    print('Para cambiar las dos contraseñas, introduce PRIMERO las actuales.')
+    secret = recovered_identity()
+    expected = PUB.read_text(encoding='utf-8').strip()
+    actual = run(['age-keygen', '-y'], input=secret, stdout=subprocess.PIPE).stdout.decode().strip()
+    if actual != expected:
+        fail('La clave recuperada no coincide. No se ha modificado nada.')
+    print('Ahora elige DOS contraseñas NUEVAS, diferentes y no vacías.')
+    layer = run(['age', '-p'], input=secret, stdout=subprocess.PIPE).stdout
+    del secret
+    new_encrypted = run(['age', '-p'], input=layer, stdout=subprocess.PIPE).stdout
+    del layer
+    if len(new_encrypted) < 100:
+        fail('No se pudo cifrar la nueva recuperación.')
+    fd, name = tempfile.mkstemp(prefix='.recuperacion-nueva-', dir=RECOVERY.parent)
+    temp = Path(name)
+    os.close(fd)
+    try:
+        temp.write_bytes(new_encrypted)
+        # Validación real de la copia nueva (se solicitarán ambas contraseñas nuevas).
+        print('Verifica las DOS contraseñas NUEVAS antes de aplicarlas.')
+        outer = run(['age', '-d', str(temp)], stdout=subprocess.PIPE).stdout
+        restored = run(['age', '-d'], input=outer, stdout=subprocess.PIPE).stdout
+        check = run(['age-keygen', '-y'], input=restored, stdout=subprocess.PIPE).stdout.decode().strip()
+        if check != expected:
+            fail('La comprobación falló. No se cambia la recuperación antigua.')
+        os.replace(temp, RECOVERY)
+    finally:
+        temp.unlink(missing_ok=True)
+    print('DOS CONTRASEÑAS CAMBIADAS correctamente.')
+    print('ALERTA: copias antiguas del archivo recuperacion-doble.age siguen usando las contraseñas antiguas.')
+    print('Haz nuevo backup y destruye las copias antiguas si quieres revocar efectivamente esas contraseñas.')
+
+
+def desinstalar():
+    if WORK.exists():
+        fail('La bóveda está ABIERTA. Ciérrala y haz un backup antes de desinstalar.')
+    print('Desinstalar SOLO quita el comando y el autocompletado.')
+    print('NO borra documentos cifrados, copias de seguridad, identidades ni configuración.')
+    print('Archivo cifrado:', archive())
+    print('Claves:', ROOT)
+    if input('Escribe DESINSTALAR para confirmar: ').strip() != 'DESINSTALAR':
+        fail('Cancelado.')
+    (Path.home() / '.local/share/zsh/site-functions/_boveda').unlink(missing_ok=True)
+    (Path.home() / '.local/bin/boveda').unlink(missing_ok=True)
+    print('Comando desinstalado. Los archivos cifrados y claves se han conservado.')
+    print('Puedes instalar de nuevo con instalar.sh y recuperar la bóveda.')
+
+
+def menu():
+    print('BÓVEDA FIDO2: abrir · cerrar · nuevo · add · listar · borrar · ubicacion · backup · exportar · llaves · claves · estado')
+    print('Usa: boveda --help')
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Bóveda age con Thetis FIDO2 o doble contraseña. Los datos en Trabajo están en claro.')
+    subs = parser.add_subparsers(dest='cmd')
+    for cmd, help_text in [
+        ('abrir', 'Abre la bóveda (FIDO2 o dos contraseñas)'),
+        ('cerrar', 'Cifra y cierra la bóveda'),
+        ('estado', 'Muestra ubicación y estado'),
+        ('listar', 'Lista documentos de la bóveda abierta'),
+        ('configurar', 'Crea las identidades si aún no existen'),
+        ('verificar', 'Comprueba las dos contraseñas'),
+        ('desinstalar', 'Desinstala el comando conservando los datos')]:
+        subs.add_parser(cmd, help=help_text)
+    p = subs.add_parser('llaves', help='Administrar hasta varias llaves FIDO2')
+    ll = p.add_subparsers(dest='llaves_cmd', required=True)
+    ll.add_parser('listar', help='Lista llaves registradas')
+    ll.add_parser('anadir', help='Añadir llave (la bóveda debe estar abierta)').add_argument('nombre')
+    ll.add_parser('quitar', help='Retirar llave (la bóveda debe estar abierta)').add_argument('nombre')
+    p = subs.add_parser('claves', help='Gestionar contraseñas de recuperación')
+    cl = p.add_subparsers(dest='claves_cmd', required=True)
+    cl.add_parser('cambiar', help='Cambiar las dos contraseñas de recuperación')
+    p = subs.add_parser('nuevo', help='Crea y abre un documento (.txt, .md, .csv, .docx, .rtf)')
+    p.add_argument('nombre')
+    p = subs.add_parser('add', help='Copia archivos o carpetas a Trabajo (sin borrar el original)')
+    p.add_argument('rutas', nargs='+')
+    p = subs.add_parser('borrar', help='Elimina documentos de Trabajo tras confirmación')
+    p.add_argument('rutas', nargs='+')
+    p = subs.add_parser('ubicacion', help='Consulta o cambia dónde se guarda el archivo cifrado, admite USB')
+    p.add_argument('ruta', nargs='?')
+    p = subs.add_parser('backup', help='Crea copia de archivo cifrado e identidades')
+    p.add_argument('destino', nargs='?')
+    p = subs.add_parser('exportar', help='Copia TODOS los documentos EN CLARO a una carpeta nueva')
+    p.add_argument('carpeta')
+    args = parser.parse_args()
+    if not args.cmd:
+        menu()
+        return
+    dispatch = {
+        'abrir': lambda: abrir(), 'cerrar': lambda: cerrar(),
+        'estado': lambda: estado(), 'listar': lambda: listar(),
+        'configurar': lambda: configurar(), 'verificar': lambda: verificar(),
+        'nuevo': lambda: nuevo(args.nombre), 'add': lambda: add(args.rutas),
+        'borrar': lambda: borrar(args.rutas), 'ubicacion': lambda: ubicacion(args.ruta),
+        'backup': lambda: backup(args.destino), 'exportar': lambda: exportar(args.carpeta),
+        'desinstalar': lambda: desinstalar(),
+    }
+    if args.cmd == 'llaves':
+        if args.llaves_cmd == 'listar': llaves_listar()
+        elif args.llaves_cmd == 'anadir': llaves_anadir(args.nombre)
+        elif args.llaves_cmd == 'quitar': llaves_quitar(args.nombre)
+    elif args.cmd == 'claves':
+        if args.claves_cmd == 'cambiar': claves_cambiar()
+    else:
+        dispatch[args.cmd]()
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (RuntimeError, OSError, EOFError, subprocess.CalledProcessError, tarfile.TarError, ValueError) as error:
+        print('ERROR:', error, file=sys.stderr)
+        sys.exit(1)

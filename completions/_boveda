@@ -1,0 +1,51 @@
+#compdef boveda
+# Autocompletado de comandos, archivos y carpetas en zsh.
+_boveda() {
+  local -a commands
+  commands=(
+    'abrir:Desbloquear la bóveda'
+    'cerrar:Cifrar y cerrar'
+    'nuevo:Crear documento'
+    'add:Importar archivos o carpetas'
+    'listar:Listar documentos'
+    'borrar:Borrar archivo de la bóveda abierta'
+    'ubicacion:Ver o cambiar ubicación cifrada (USB incluido)'
+    'backup:Crear backup cifrado'
+    'exportar:Copiar documentos en claro a otra carpeta'
+    'estado:Ver estado'
+    'configurar:Configurar llaves'
+    'verificar:Verificar doble contraseña'
+    'desinstalar:Desinstalar sin borrar datos'
+    'llaves:Gestionar múltiples llaves FIDO2'
+    'claves:Cambiar las dos contraseñas'
+  )
+  if (( CURRENT == 2 )); then
+    _describe -t commands 'comando' commands
+    return
+  fi
+  case "${words[2]}" in
+    add) _files ;;
+    ubicacion|backup|exportar) _files -/ ;;
+    borrar)
+      local -a entries
+      entries=( ${(f)"$(command find "$HOME/BovedaFIDO2/Trabajo" -mindepth 1 -maxdepth 1 -print 2>/dev/null | command sed "s|^$HOME/BovedaFIDO2/Trabajo/||")"} )
+      _describe 'documentos en bóveda' entries
+      ;;
+    llaves)
+      if (( CURRENT == 3 )); then
+        local -a keyops
+        keyops=('listar:Ver llaves' 'anadir:Añadir llave FIDO2' 'quitar:Quitar llave')
+        _describe 'gestión llaves' keyops
+      fi
+      ;;
+    claves)
+      if (( CURRENT == 3 )); then
+        local -a pwops
+        pwops=('cambiar:Cambiar las dos contraseñas')
+        _describe 'gestión contraseñas' pwops
+      fi
+      ;;
+    nuevo) _message 'nombre.txt, nombre.md, nombre.docx o nombre.rtf' ;;
+  esac
+}
+_boveda "$@"
